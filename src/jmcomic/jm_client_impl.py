@@ -1,6 +1,7 @@
 from .jm_client_interface import *
 
 
+# noinspection PyAbstractClass
 class AbstractJmClient(
     JmcomicClient,
     PostmanProxy,
@@ -39,21 +40,32 @@ class AbstractJmClient(
                            retry_count=0,
                            **kwargs,
                            ):
+        """
+        统一请求，支持重试
+        @param request: 请求方法
+        @param url: 图片url / path (/album/xxx)
+        @param domain_index: 域名下标
+        @param retry_count: 重试次数
+        @param kwargs: 请求方法的kwargs
+        """
         if domain_index >= len(self.domain_list):
-            raise AssertionError("All domains failed.")
+            self.fallback(request, url, domain_index, retry_count, **kwargs)
 
-        domain = self.domain_list[domain_index]
-
-        if not url.startswith(JmModuleConfig.PROT):
+        if url.startswith('/'):
+            # path
+            domain = self.domain_list[domain_index]
             url = self.of_api_url(url, domain)
             jm_debug('api', url)
+        else:
+            # 图片url
+            pass
 
-        if domain_index != 0 and retry_count != 0:
+        if domain_index != 0 or retry_count != 0:
             jm_debug(
-                f'请求重试',
+                f'request_retry',
                 ', '.join([
                     f'次数: [{retry_count}/{self.retry_times}]',
-                    f'域名: [{domain} ({domain_index}/{len(self.domain_list)})]',
+                    f'域名: [{domain_index} of {self.domain_list}]',
                     f'路径: [{url}]',
                     f'参数: [{kwargs if "login" not in url else "#login_form#"}]'
                 ])
@@ -64,10 +76,10 @@ class AbstractJmClient(
         except Exception as e:
             self.before_retry(e, kwargs, retry_count, url)
 
-            if retry_count < self.retry_times:
-                return self.request_with_retry(request, url, domain_index, retry_count + 1, **kwargs)
-            else:
-                return self.request_with_retry(request, url, domain_index + 1, 0, **kwargs)
+        if retry_count < self.retry_times:
+            return self.request_with_retry(request, url, domain_index, retry_count + 1, **kwargs)
+        else:
+            return self.request_with_retry(request, url, domain_index + 1, 0, **kwargs)
 
     # noinspection PyMethodMayBeStatic, PyUnusedLocal
     def before_retry(self, e, kwargs, retry_count, url):
@@ -75,23 +87,32 @@ class AbstractJmClient(
 
     def enable_cache(self, debug=False):
         def wrap_func_cache(func_name, cache_dict_name):
-            if hasattr(self, cache_dict_name):
-                return
+            import common
+            if common.VERSION > '0.4.8':
+                if hasattr(self, cache_dict_name):
+                    return
 
-            cache_dict = {}
-            setattr(self, cache_dict_name, cache_dict)
+                cache = common.cache
+                cache_dict = {}
+                cache_hit_msg = (f'【缓存命中】{cache_dict_name} ' + '→ [{}]') if debug is True else None
+                cache_miss_msg = (f'【缓存缺失】{cache_dict_name} ' + '← [{}]') if debug is True else None
+                cache = cache(
+                    cache_dict=cache_dict,
+                    cache_hit_msg=cache_hit_msg,
+                    cache_miss_msg=cache_miss_msg,
+                )
+                setattr(self, cache_dict_name, cache_dict)
+            else:
+                if sys.version_info < (3, 9):
+                    raise NotImplementedError('不支持启用JmcomicClient缓存。\n'
+                                              '请更新python版本到3.9以上，'
+                                              '或更新commonX: `pip install commonX --upgrade`')
+                import functools
+                cache = functools.cache
 
             # 重载本对象的方法
             func = getattr(self, func_name)
-
-            cache_hit_msg = f'【缓存命中】{cache_dict_name} ' + '→ [{}]' if debug is True else None
-            cache_miss_msg = f'【缓存缺失】{cache_dict_name} ' + '← [{}]' if debug is True else None
-
-            wrap_func = enable_cache(
-                cache_dict=cache_dict,
-                cache_hit_msg=cache_hit_msg,
-                cache_miss_msg=cache_miss_msg,
-            )(func)
+            wrap_func = cache(func)
 
             setattr(self, func_name, wrap_func)
 
@@ -107,6 +128,9 @@ class AbstractJmClient(
 
     def get_jmcomic_domain_all(self, postman=None):
         return JmModuleConfig.get_jmcomic_domain_all(postman or self.get_root_postman())
+
+    def fallback(self, request, url, domain_index, retry_count, **kwargs):
+        raise AssertionError(f"请求重试全部失败: [{url}], {self.domain_list}")
 
 
 # 基于网页实现的JmClient
@@ -138,21 +162,11 @@ class JmHtmlClient(AbstractJmClient):
 
         return photo_detail
 
-    def ensure_photo_can_use(self, photo_detail: JmPhotoDetail):
-        # 检查 from_album
-        if photo_detail.from_album is None:
-            photo_detail.from_album = self.get_album_detail(photo_detail.album_id)
-
-        # 检查 page_arr 和 data_original_domain
-        if photo_detail.page_arr is None or photo_detail.data_original_domain is None:
-            new = self.get_photo_detail(photo_detail.photo_id, False)
-            new.from_album = photo_detail.from_album
-            photo_detail.__dict__.update(new.__dict__)
-
-    def search_album(self, search_query, main_tag=0):
+    def search_album(self, search_query, main_tag=0, page=1) -> JmSearchPage:
         params = {
             'main_tag': main_tag,
             'search_query': search_query,
+            'page': page,
         }
 
         resp = self.get_jm_html('/search/photos', params=params, allow_redirects=True)
@@ -160,7 +174,8 @@ class JmHtmlClient(AbstractJmClient):
         # 检查是否发生了重定向
         # 因为如果搜索的是禁漫车号，会直接跳转到本子详情页面
         if resp.redirect_count != 0 and '/album/' in resp.url:
-            return JmcomicText.analyse_jm_album_html(resp.text)
+            album = JmcomicText.analyse_jm_album_html(resp.text)
+            return JmSearchPage.wrap_single_album(album)
         else:
             return JmSearchSupport.analyse_jm_search_html(resp.text)
 
@@ -202,7 +217,7 @@ class JmHtmlClient(AbstractJmClient):
         resp = self.get(url, **kwargs)
 
         if require_200 is True and resp.status_code != 200:
-            write_text('./resp.html', resp.text)
+            # write_text('./resp.html', resp.text)
             self.check_special_http_code(resp)
             self.raise_request_error(resp)
 
@@ -226,7 +241,60 @@ class JmHtmlClient(AbstractJmClient):
         raise AssertionError(msg)
 
     def get_jm_image(self, img_url) -> JmImageResp:
-        return JmImageResp(self.get(img_url))
+
+        def get_if_fail_raise(url):
+            """
+            使用此方法包装 self.get
+            """
+            resp = JmImageResp(self.get(url))
+
+            if resp.is_success:
+                return resp
+
+            self.raise_request_error(
+                resp.resp, resp.get_error_msg()
+            )
+
+            return resp
+
+        return self.request_with_retry(get_if_fail_raise, img_url)
+
+    def album_comment(self,
+                      video_id,
+                      comment,
+                      originator='',
+                      status='true',
+                      comment_id=None,
+                      **kwargs,
+                      ) -> JmAcResp:
+        data = {
+            'video_id': video_id,
+            'comment': comment,
+            'originator': originator,
+            'status': status,
+        }
+
+        # 处理回复评论
+        if comment_id is not None:
+            data.pop('status')
+            data['comment_id'] = comment_id
+            data['is_reply'] = 1
+            data['forum_subject'] = 1
+
+        jm_debug('album_comment',
+                 f'{video_id}: [{comment}]' +
+                 (f' to ({comment_id})' if comment_id is not None else '')
+                 )
+
+        resp = self.post('https://18comic.vip/ajax/album_comment',
+                         headers=JmModuleConfig.album_comment_headers,
+                         data=data,
+                         )
+
+        ret = JmAcResp(resp)
+        jm_debug('album_comment', f'{video_id}: [{comment}] ← ({ret.model().cid})')
+
+        return ret
 
     @classmethod
     def require_resp_success_else_raise(cls, resp, req_url):
@@ -284,7 +352,7 @@ class JmHtmlClient(AbstractJmClient):
 class JmApiClient(AbstractJmClient):
     API_SEARCH = '/search'
 
-    def search_album(self, search_query: str, main_tag=0) -> JmApiResp:
+    def search_album(self, search_query, main_tag=0, page=1) -> JmApiResp:
         """
         model_data: {
           "search_query": "MANA",
@@ -312,6 +380,8 @@ class JmApiClient(AbstractJmClient):
             self.API_SEARCH,
             params={
                 'search_query': search_query,
+                'main_tag': main_tag,
+                'page': page,
             }
         )
 

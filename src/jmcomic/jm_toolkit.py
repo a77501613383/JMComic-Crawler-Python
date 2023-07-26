@@ -11,6 +11,7 @@ class JmcomicText:
     pattern_html_photo_title = compile('<title>(.*?)\|.*</title>')
     # pattern_html_photo_data_original_list = compile('data-original="(.*?)" id="album_photo_.+?"')
     pattern_html_photo_data_original_domain = compile('src="https://(.*?)/media/albums/blank')
+    pattern_html_photo_data_original_0 = compile('data-original="(.*?)" id="album_photo')
     pattern_html_photo_keywords = compile('<meta name="keywords"[\s\S]*?content="(.*?)"')
     pattern_html_photo_series_id = compile('var series_id = (\d+);')
     pattern_html_photo_sort = compile('var sort = (\d+);')
@@ -51,6 +52,11 @@ class JmcomicText:
         if not isinstance(text, str):
             raise AssertionError(f"无法解析jm车号, 参数类型为: {type(text)}")
 
+        # 43210
+        if text.isdigit():
+            return text
+
+        # Jm43210
         if len(text) <= 2:
             raise AssertionError(f"无法解析jm车号, 文本为: {text}")
 
@@ -60,11 +66,6 @@ class JmcomicText:
         if (c0 == 'J' or c0 == 'j') and (c1 == 'M' or c1 == 'm'):
             # JM123456
             return text[2:]
-
-        elif text.isdigit():
-            # 123456
-            return str(text)
-
         else:
             # https://xxx/photo/412038
             match = cls.pattern_jm_pa_id.search(text)
